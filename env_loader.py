@@ -40,14 +40,19 @@ def load_shared_env(script_file: str) -> Path | None:
     path = shared_env_path(script_file)
     if not path.is_file():
         return None
+    # Telegram 路由以共享文件为准，避免系统/用户环境变量里残留旧 TG_CHAT_ID
+    _TG_FROM_FILE = {"TG_BOT_TOKEN", "TG_CHAT_ID"}
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 key, val = k.strip(), v.strip()
-                os.environ.setdefault(key, val)
+                if key in _TG_FROM_FILE:
+                    os.environ[key] = val
+                else:
+                    os.environ.setdefault(key, val)
     tok = os.environ.get("TG_BOT_TOKEN", "")
     if tok:
-        os.environ.setdefault("TELEGRAM_BOT_TOKEN", tok)
+        os.environ["TELEGRAM_BOT_TOKEN"] = tok
     return path
