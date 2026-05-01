@@ -4,7 +4,12 @@
 
 ---
 
-## 2026-05-01
+## 2026-05-01 — 与 Web3 Monitor / 后端对齐
+
+### Ingest `worker` 约定（链上叙事）
+
+- 上报 JSON 中建议使用 **`worker: "onchain-radar"`**，与前端 `web3-monitor` 注册表一致，链上页按后端 **`type=onchain`** 展示。
+- 历史别名 **`onchain_narrative_radar`** 在前端仍映射为同一 worker 展示名。
 
 ### 新增 `env_loader.py`（共享环境加载）
 
@@ -18,9 +23,23 @@
 
 - 被以下模块引用：`accumulation-radar`、`accumulation-fastsignal-radar`、`onChain-radar`、`binance-alpha-monitor`、`Ai-Trading`（均通过 `sys.path` 插入 Core-Strategy 根目录后 `from env_loader import load_shared_env`）。
 
+### 新增 `node_bridge.py`（统一策略输出桥）
+
+- **目的**：统一策略输出格式，供 Node 后端消费；保持 Python 仅做计算层，不直连数据库。
+- **输出能力**：
+  - 文件输出：`node_out/{strategy_id}_latest.json`
+  - 事件流追加：`node_out/signals.jsonl`、`node_out/events.jsonl`
+  - HTTP 上报：当设置 `CORE_STRATEGY_INGEST_URL` 时，自动 POST 到 Node 的 ingest API。
+- **鉴权头**：
+  - 优先读取 `STRATEGY_INGEST_SECRET`
+  - 兼容 `STRATEGY_INGEST_TOKEN` 旧变量名
+  - 请求头统一为 `x-strategy-token`
+- **当前接口约定**：默认拼接 `.../api/core-strategy/ingest`，也兼容直接传入以 `/ingest` 结尾的完整 URL。
+
 ### 运维提示
 
 - `.env.oi` 仅保存在本地，勿提交版本库；Token 泄露需在 BotFather 轮换。
+- Python 侧 HTTP 上报依赖 `requests`；若缺失请安装后再启用 ingest。
 
 ---
 

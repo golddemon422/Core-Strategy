@@ -1,2 +1,5 @@
 node_out/
+__pycache__/
+*.pyc
+.mypy_cache/
 
