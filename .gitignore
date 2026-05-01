@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 .mypy_cache/
 
+# Each subdirectory below is its own Git repo — hide from this umbrella repo’s SCM / status
+Ai-Trading/
+accumulation-fastsignal-radar/
+accumulation-radar/
+binance-alpha-monitor/
+onChain-radar/
+
