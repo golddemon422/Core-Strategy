@@ -1,0 +1,10 @@
+[tool.pylint.MASTER]
+# 向上查找含 env_loader.py 的目录（即 Core-Strategy 根），与 s2 脚本 sys.path 一致
+init-hook = """
+import sys
+from pathlib import Path
+for d in [Path.cwd(), *Path.cwd().parents]:
+    if (d / "env_loader.py").is_file():
+        sys.path.insert(0, str(d.resolve()))
+        break
+"""
