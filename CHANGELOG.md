@@ -4,6 +4,19 @@
 
 ---
 
+## 2026-05-02 — node_bridge 资金费率字段
+
+### `canonical_exchange_metrics` / `fr_pct`
+
+- **`fr_pct` 写入 `metrics.fundingRateSignal`**，不再写入 `fundingRate`，与后端归一化及 WebUI「策略费率信号」一致。
+- 实盘 **资金费率** 由前端经后端 **`/api/exchange/binance-funding`** 拉取币安 `premiumIndex`。
+
+### accumulation-radar（S4）补充（摘要）
+
+- **OI 异动 / 空头燃料 / 收筹池** 等与 Telegram 同源的 **逐标的** `POST` Node 事件（`subType`、`scan_batch_id`、`event_scope=symbol`），便于交易所工作台按 tab 计数与筛选。细节见策略脚本与仓库根 `WEB3TOOLS_SYSTEM_OVERVIEW.md`。
+
+---
+
 ## 2026-05-01 — 与 Web3 Monitor / 后端对齐
 
 ### Ingest `worker` 约定（链上叙事）
