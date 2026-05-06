@@ -1,10 +1,23 @@
 [tool.pylint.MASTER]
-# 向上查找含 env_loader.py 的目录（即 Core-Strategy 根），与 s2 脚本 sys.path 一致
+# 向上查找含 env_loader.py + node_bridge.py 的目录（即 Core-Strategy 根），与 s1/s2 脚本 sys.path 一致。
+# 支持：在子目录 onChain-radar 下执行 pylint、或工作区根为 Web3Tools 时从 Core-Strategy 子目录解析。
 init-hook = """
 import sys
 from pathlib import Path
-for d in [Path.cwd(), *Path.cwd().parents]:
-    if (d / "env_loader.py").is_file():
-        sys.path.insert(0, str(d.resolve()))
+here = Path.cwd().resolve()
+candidates = [here]
+sub = here / "Core-Strategy"
+if sub.is_dir():
+    candidates.append(sub)
+candidates.extend(here.parents)
+for d in candidates:
+    try:
+        p = Path(d).resolve()
+    except Exception:
+        continue
+    if (p / "env_loader.py").is_file() and (p / "node_bridge.py").is_file():
+        s = str(p)
+        if s not in sys.path:
+            sys.path.insert(0, s)
         break
 """

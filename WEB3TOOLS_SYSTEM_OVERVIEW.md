@@ -44,25 +44,33 @@ Core-Strategy/
 ├── env_loader.py          # 共享 .env.oi
 ├── node_bridge.py         # HTTP ingest；canonical metrics；fr_pct → fundingRateSignal
 ├── CHANGELOG.md
-├── accumulation-radar/    # S4：收筹池、OI异动、空头燃料等 **逐标的 ingest**
-├── accumulation-fastsignal-radar/
-├── onChain-radar/
-├── binance-alpha-monitor/
-└── Ai-Trading/
+├── onChain-radar/                  # S1
+├── binance-alpha-monitor/          # S2
+├── OI_Funding_rate_scaner/        # S3
+├── Ai-Trading/                     # S4
+├── accumulation-fastsignal-radar/  # S5
+└── accumulation-radar/             # S6：收筹池、OI异动、空头燃料等 **逐标的 ingest**
 ```
+
+与本机 **Launcher** 对应：上级目录 `Web3Tools/run-logs/launchers/s1.ps1`…`s6.ps1` 与 S1–S6 一一对应，完整表见根目录 **`WEB3TOOLS_SYSTEM_OVERVIEW.md` §4.2**。
 
 ### 4.1 共享配置
 
 - Telegram：`accumulation-radar/.env.oi`
 - Ingest：`CORE_STRATEGY_INGEST_URL`、`STRATEGY_INGEST_SECRET` / `STRATEGY_INGEST_TOKEN`
 
-### 4.2 策略模块一览
+### 4.2 策略模块一览（与根总览同步）
 
-| 模块 | 入口 | 数据源 | 输出 |
-|------|------|--------|------|
-| accumulation-radar | `s4_accumulation_radar.py` | 币安合约 REST | Node 逐标的 + TG + SQLite |
-| accumulation-fastsignal-radar | `s5_accumulation_radar.py` | 币安 + CG 等 | TG + ingest |
-| 其他 | s1–s3 | 见根总览 | — |
+完整 **S1–S6 入口脚本与 `run-logs/launchers/sN.ps1`** 对照见 **`../WEB3TOOLS_SYSTEM_OVERVIEW.md` §4.2**。本仓库内：
+
+| 模块 | 入口脚本 |
+|------|-----------|
+| onChain-radar | `s1_on_chain_narrative_radar.py` |
+| binance-alpha-monitor | `s2_alpha_monitor.py` |
+| OI_Funding_rate_scaner | `s3_oi_funding_rate_scanner.py` |
+| Ai-Trading | `s4_futures_alpha_autonomous_trading_v1.py` |
+| accumulation-fastsignal-radar | `s5_accumulation_radar.py` |
+| accumulation-radar | `S6_accumulation_radar.py` |
 
 ### 4.3 `node_bridge` 与资金费率字段
 
@@ -72,8 +80,14 @@ Core-Strategy/
 ### 4.4 合约工作台与 S5 运行（与 `web3-monitor` 对齐摘要）
 
 - **Node `recent` 拉取**：工作台建议 **`type=exchange`、`eventScope=all`、`limit≤600`**，以同时包含 **逐标的** 与 **`write_strategy_output` 的 `batch`** 行；仅 `symbol` 时 batch 不进入列表。
-- **Worker 状态 `x/3`**：只计 **S4** `accumulation_radar`、**S5** `heat_radar`、**S3** `futures_alpha_scanner`；**Worker 心跳** 条带白名单同三（不含 `binance_alpha_monitor`）。心跳绿/红由 **全表** 该 worker 最后 `createdAt` 与约 **12h** 阈值决定。
+- **Worker 状态 `x/4`**（合约核心四条）：**S3** `oi_funding_scanner`、**S4** `futures_alpha_scanner`、**S5** `heat_radar`、**S6** `accumulation_radar`（不含 `binance_alpha_monitor`）。**Worker 心跳**条带白名单同上。心跳绿/红由 **全表** 该 worker 最后 `createdAt` 与约 **12h** 阈值决定。
 - **S5**：`s5_accumulation_radar.py` **无参** = 常驻、**每 30 分钟**一轮；**`once`** = 单轮。末轮 **`write_strategy_output`** 为 **batch**；热币循环 **`append_signal_event`** 为 **symbol** 级。
+
+### 4.5 运维脚本位置（跨仓库）
+
+- **PostgreSQL**：`web3-monitor-backed/scripts/db-cleanup/`（清理 **`signal_events` 历史**时的归档 SQL；**不删** wallet/social/paper）。
+- **S1 SQLite 去重**：同目录 **`cleanup_s1_sqlite_dedupe.ps1`**（备份后清空 `signals_sent`）。
+- **链上页轮询**：前端仓库环境变量 **`NEXT_PUBLIC_ONCHAIN_POLL_MS`** / **`NEXT_PUBLIC_ONCHAIN_WORKER_POLL_MS`**（见 `web3-monitor/CHANGELOG.md`）。
 
 ---
 
