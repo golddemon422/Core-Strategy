@@ -40,8 +40,18 @@ def load_shared_env(script_file: str) -> Path | None:
     path = shared_env_path(script_file)
     if not path.is_file():
         return None
-    # Telegram 路由以共享文件为准，避免系统/用户环境变量里残留旧 TG_CHAT_ID
-    _TG_FROM_FILE = {"TG_BOT_TOKEN", "TG_CHAT_ID"}
+    # Telegram 路由以共享文件为准，避免系统/用户环境变量里残留旧 TG 配置
+    _TG_FROM_FILE = {
+        "TG_BOT_TOKEN",
+        "TG_CHAT_ID",
+        "S1_TG_MESSAGE_THREAD_ID",
+        "FUTURES_TG_MESSAGE_THREAD_ID",
+        "S2_TG_MESSAGE_THREAD_ID",
+        "S3_TG_MESSAGE_THREAD_ID",
+        "S4_TG_MESSAGE_THREAD_ID",
+        "S5_TG_MESSAGE_THREAD_ID",
+        "S6_TG_MESSAGE_THREAD_ID",
+    }
     def _strip_val(raw: str) -> str:
         s = raw.strip()
         if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
@@ -62,3 +72,16 @@ def load_shared_env(script_file: str) -> Path | None:
     if tok:
         os.environ["TELEGRAM_BOT_TOKEN"] = tok
     return path
+
+
+def parse_tg_thread_id(*env_names: str) -> int | None:
+    """Read first set forum topic id from env (after load_shared_env)."""
+    for name in env_names:
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return None
