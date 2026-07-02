@@ -1,14 +1,35 @@
+# Secrets and local env
+.env
+.env.*
+
+# Logs and runtime output
+*.log
+run-logs/
+run-state/
+
+# Process and launcher runtime
+pids/
+
+# Strategy outputs and caches
 node_out/
 __pycache__/
 *.pyc
 .mypy_cache/
-run-logs/
+cache/
+tmp/
 
-# Each subdirectory below is its own Git repo — hide from this umbrella repo’s SCM / status
+# Databases and dumps
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store
+
+# Each subdirectory below is its own Git repo — hide from this umbrella repo's SCM / status
 Ai-Trading/
 accumulation-fastsignal-radar/
 accumulation-radar/
 binance-alpha-monitor/
 OI_Funding_rate_scaner/
 onChain-radar/
-
