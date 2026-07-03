@@ -32,6 +32,9 @@ Status = Literal[
     "process_stopped",
     "heartbeat_error",
     "phase_overdue",
+    "business_api_fail",
+    "business_sla_stale",
+    "business_scan_stale",
 ]
 
 REPO_ROOT = Path(r"D:\Web3Tools")
@@ -45,6 +48,9 @@ LAUNCHER_PS1 = REPO_ROOT / "launchers" / "launch_strategy.ps1"
 
 ERROR_RESTART_MIN_COUNT = 3
 ERROR_RESTART_RECENT_SEC = 300
+BUSINESS_SLA_STRATEGIES = frozenset({"S5", "S6"})
+BUSINESS_INTERVAL_SEC = 1800
+BUSINESS_STALE_MULTIPLIER = 2
 
 
 @dataclass(frozen=True)
@@ -116,9 +122,16 @@ class StrategyCheckResult:
     reason: str
     dry_run: bool = True
     would_restart_command: str | None = None
+    business_status: str | None = None
+    business_reason: str | None = None
+    last_scan_outcome: str | None = None
+    last_scan_completed_at: str | None = None
+    last_telegram_sent_at: str | None = None
+    consecutive_scan_failures: int | None = None
+    last_api_error_at: str | None = None
 
     def to_row(self) -> dict[str, Any]:
-        return {
+        row = {
             "strategy": self.strategy,
             "worker": self.worker,
             "pid_file_pid": self.pid_file_pid,
@@ -131,6 +144,15 @@ class StrategyCheckResult:
             "decision": self.decision,
             "reason": self.reason,
         }
+        if self.strategy in BUSINESS_SLA_STRATEGIES:
+            row["businessStatus"] = self.business_status
+            row["businessReason"] = self.business_reason
+            row["lastScanOutcome"] = self.last_scan_outcome
+            row["lastScanCompletedAt"] = self.last_scan_completed_at
+            row["lastTelegramSentAt"] = self.last_telegram_sent_at
+            row["consecutiveScanFailures"] = self.consecutive_scan_failures
+            row["lastApiErrorAt"] = self.last_api_error_at
+        return row
 
 
 def _utc_now() -> datetime:
@@ -166,6 +188,88 @@ def _restart_command(strategy: str) -> str:
         f'powershell -NoProfile -ExecutionPolicy Bypass -File "{LAUNCHER_PS1}" '
         f"-Strategy {strategy} -Force"
     )
+
+
+def _populate_business_fields(result: StrategyCheckResult, hb: dict[str, Any]) -> None:
+    result.last_scan_outcome = hb.get("lastScanOutcome") if isinstance(hb.get("lastScanOutcome"), str) else None
+    result.last_scan_completed_at = (
+        hb.get("lastScanCompletedAt") if isinstance(hb.get("lastScanCompletedAt"), str) else None
+    )
+    result.last_telegram_sent_at = (
+        hb.get("lastTelegramSentAt") if isinstance(hb.get("lastTelegramSentAt"), str) else None
+    )
+    consec = hb.get("consecutiveScanFailures")
+    result.consecutive_scan_failures = int(consec) if isinstance(consec, int) else None
+    result.last_api_error_at = hb.get("lastApiErrorAt") if isinstance(hb.get("lastApiErrorAt"), str) else None
+
+
+def _evaluate_business_sla(
+    strategy: str,
+    hb: dict[str, Any],
+    now: datetime,
+    base: StrategyCheckResult,
+) -> StrategyCheckResult:
+    if strategy not in BUSINESS_SLA_STRATEGIES:
+        return base
+
+    _populate_business_fields(base, hb)
+    expected = hb.get("expectedIntervalSec")
+    interval = int(expected) if isinstance(expected, int) and expected > 0 else BUSINESS_INTERVAL_SEC
+    stale_limit = interval * BUSINESS_STALE_MULTIPLIER
+
+    warn_reasons: list[str] = []
+    business_status: Status | None = None
+
+    outcome = base.last_scan_outcome
+    consec = base.consecutive_scan_failures
+    if outcome == "binance_api_fail" and isinstance(consec, int) and consec >= 2:
+        business_status = "business_api_fail"
+        warn_reasons.append(f"consecutive Binance API failures ({consec})")
+
+    if base.last_telegram_sent_at:
+        tg_age = _age_sec(base.last_telegram_sent_at, now)
+        if tg_age is not None and tg_age > stale_limit:
+            if business_status is None:
+                business_status = "business_sla_stale"
+            warn_reasons.append(
+                f"no Futures Radar Telegram send for >2 intervals ({int(tg_age)}s > {stale_limit}s)"
+            )
+
+    if base.last_scan_completed_at:
+        scan_age = _age_sec(base.last_scan_completed_at, now)
+        if scan_age is not None and scan_age > stale_limit:
+            if business_status is None:
+                business_status = "business_scan_stale"
+            warn_reasons.append(
+                f"no successful scan completion for >2 intervals ({int(scan_age)}s > {stale_limit}s)"
+            )
+
+    if warn_reasons:
+        base.decision = max_decision(base.decision, "would_warn")
+        if business_status is not None:
+            base.status = business_status
+        base.business_status = business_status
+        base.business_reason = "; ".join(warn_reasons)
+        if base.decision == "would_warn" and base.reason and "Binance API" not in base.reason:
+            base.reason = f"{base.business_reason}; process: {base.reason}"
+        elif base.decision == "would_warn":
+            base.reason = base.business_reason
+    else:
+        base.business_status = "ok"
+        base.business_reason = None
+
+    return base
+
+
+def _finalize_result(
+    strategy: str,
+    hb: dict[str, Any] | None,
+    now: datetime,
+    result: StrategyCheckResult,
+) -> StrategyCheckResult:
+    if hb is not None and strategy in BUSINESS_SLA_STRATEGIES:
+        return _evaluate_business_sla(strategy, hb, now, result)
+    return result
 
 
 def read_pid_file(path: Path) -> int | None:
@@ -373,12 +477,13 @@ def evaluate_strategy(
         dry_run=dry_run,
         would_restart_command=_restart_command(strategy),
     )
+    hb: dict[str, Any] | None = None
 
     if pid_file_pid is not None and process_alive is False:
         base.status = "process_stopped"
         base.decision = "would_restart"
         base.reason = f"PID file {pid_file_pid} is not a running process"
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     hb, hb_err = read_heartbeat_file(hb_path)
     if hb_err == "missing":
@@ -389,13 +494,13 @@ def evaluate_strategy(
         else:
             base.decision = "would_restart"
             base.reason = "heartbeat file missing and no alive launcher process"
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     if hb is None:
         base.status = "invalid_heartbeat"
         base.decision = "would_warn"
         base.reason = f"heartbeat file unreadable ({hb_err})"
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     hb_status = str(hb.get("status") or "")
     hb_phase = str(hb.get("phase") or "") or None
@@ -415,26 +520,26 @@ def evaluate_strategy(
             base.status = "process_stopped"
             base.decision = "would_restart"
             base.reason = f"heartbeat pid {heartbeat_pid} is not running"
-            return base
+            return _finalize_result(strategy, hb, now, base)
 
     if hb_status == "error":
         decision, reason = _error_decision(hb, now)
         base.status = "heartbeat_error"
         base.decision = decision
         base.reason = reason
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     if cfg.respect_sleep_schedule and hb_status == "sleeping" and _is_future_iso(next_run_at, now):
         base.status = "sleeping_ok"
         base.decision = "ok"
         base.reason = "sleeping with nextRunAt in the future"
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     if hb_status == "sleeping" and _is_future_iso(next_run_at, now):
         base.status = "sleeping_ok"
         base.decision = "ok"
         base.reason = "sleeping with nextRunAt in the future"
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     if heartbeat_age is not None and heartbeat_age <= cfg.stale_after_sec:
         overdue, overdue_reason = _phase_overdue(hb, cfg, now, heartbeat_age)
@@ -446,18 +551,18 @@ def evaluate_strategy(
             else:
                 base.decision = cfg.phase_overdue_action
                 base.reason = overdue_reason
-            return base
+            return _finalize_result(strategy, hb, now, base)
 
         if hb_phase == "idle" or hb_status == "idle":
             base.status = "idle"
             base.decision = "ok"
             base.reason = "heartbeat fresh and idle"
-            return base
+            return _finalize_result(strategy, hb, now, base)
 
         base.status = "healthy"
         base.decision = "ok"
         base.reason = f"heartbeat age {int(heartbeat_age)}s <= stale threshold {cfg.stale_after_sec}s"
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     overdue, overdue_reason = _phase_overdue(hb, cfg, now, heartbeat_age)
     if overdue and overdue_reason:
@@ -468,13 +573,13 @@ def evaluate_strategy(
         else:
             base.decision = max_decision(cfg.phase_overdue_action, _age_decision(cfg, heartbeat_age))
             base.reason = overdue_reason
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     if heartbeat_age is None:
         base.status = "invalid_heartbeat"
         base.decision = "would_warn"
         base.reason = "missing or unparseable lastHeartbeatAt"
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     if heartbeat_age <= cfg.offline_after_sec:
         base.status = "stale"
@@ -487,7 +592,7 @@ def evaluate_strategy(
         )
         if cap_detail:
             base.reason += f"; {cap_detail} (warn only during long phase)"
-        return base
+        return _finalize_result(strategy, hb, now, base)
 
     base.status = "offline"
     decision = cfg.offline_action
@@ -496,7 +601,7 @@ def evaluate_strategy(
     base.reason = f"heartbeat age {int(heartbeat_age)}s > offline threshold {cfg.offline_after_sec}s"
     if cap_detail:
         base.reason += f"; {cap_detail} (warn only during long phase)"
-    return base
+    return _finalize_result(strategy, hb, now, base)
 
 
 def _age_decision(cfg: StrategyWatchdogConfig, heartbeat_age: float | None) -> Decision:

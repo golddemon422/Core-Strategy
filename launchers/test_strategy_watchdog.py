@@ -232,6 +232,111 @@ class StrategyWatchdogTests(unittest.TestCase):
         self.assertEqual(compute_exit_code([ok, warn]), 1)
         self.assertEqual(compute_exit_code([ok, warn, restart]), 2)
 
+    def test_s5_fresh_heartbeat_recent_tg_ok(self) -> None:
+        _write_hb(
+            self.state_dir,
+            "S5",
+            _base_hb(
+                strategy="S5",
+                worker="heat_radar",
+                status="sleeping",
+                phase="sleep",
+                lastHeartbeatAt=_iso_ago(60),
+                nextRunAt=_iso_offset(1700),
+                lastScanOutcome="ok",
+                lastScanCompletedAt=_iso_ago(600),
+                lastTelegramSentAt=_iso_ago(600),
+                consecutiveScanFailures=0,
+                expectedIntervalSec=1800,
+            ),
+        )
+        r = self._eval("S5")
+        self.assertEqual(r.decision, "ok")
+        self.assertIn(r.status, ("sleeping_ok", "healthy"))
+
+    def test_s5_sleeping_stale_telegram_would_warn(self) -> None:
+        _write_hb(
+            self.state_dir,
+            "S5",
+            _base_hb(
+                strategy="S5",
+                worker="heat_radar",
+                status="sleeping",
+                phase="sleep",
+                lastHeartbeatAt=_iso_ago(30),
+                nextRunAt=_iso_offset(1700),
+                lastScanOutcome="binance_api_fail",
+                lastScanCompletedAt=_iso_ago(4000),
+                lastTelegramSentAt=_iso_ago(4000),
+                consecutiveScanFailures=1,
+                expectedIntervalSec=1800,
+            ),
+        )
+        r = self._eval("S5")
+        self.assertEqual(r.decision, "would_warn")
+        self.assertEqual(r.status, "business_sla_stale")
+
+    def test_s6_consecutive_api_fail_would_warn(self) -> None:
+        _write_hb(
+            self.state_dir,
+            "S6",
+            _base_hb(
+                strategy="S6",
+                worker="accumulation_radar",
+                status="sleeping",
+                phase="sleep",
+                lastHeartbeatAt=_iso_ago(45),
+                nextRunAt=_iso_offset(1700),
+                lastScanOutcome="binance_api_fail",
+                lastScanCompletedAt=_iso_ago(500),
+                lastTelegramSentAt=_iso_ago(500),
+                consecutiveScanFailures=2,
+                lastApiErrorAt=_iso_ago(60),
+                expectedIntervalSec=1800,
+            ),
+        )
+        r = self._eval("S6")
+        self.assertEqual(r.decision, "would_warn")
+        self.assertEqual(r.status, "business_api_fail")
+
+    def test_s6_stale_scan_fresh_heartbeat_would_warn(self) -> None:
+        _write_hb(
+            self.state_dir,
+            "S6",
+            _base_hb(
+                strategy="S6",
+                worker="accumulation_radar",
+                status="healthy",
+                phase="idle",
+                lastHeartbeatAt=_iso_ago(20),
+                lastScanOutcome="ok",
+                lastScanCompletedAt=_iso_ago(4000),
+                lastTelegramSentAt=_iso_ago(500),
+                consecutiveScanFailures=0,
+                expectedIntervalSec=1800,
+            ),
+        )
+        r = self._eval("S6")
+        self.assertEqual(r.decision, "would_warn")
+        self.assertEqual(r.status, "business_scan_stale")
+
+    def test_s3_sleeping_future_next_run_still_ok(self) -> None:
+        _write_hb(
+            self.state_dir,
+            "S3",
+            _base_hb(
+                strategy="S3",
+                worker="oi_funding_scanner",
+                status="sleeping",
+                phase="sleep",
+                lastHeartbeatAt=_iso_ago(120),
+                nextRunAt=_iso_offset(3600),
+            ),
+        )
+        r = self._eval("S3")
+        self.assertEqual(r.decision, "ok")
+        self.assertEqual(r.status, "sleeping_ok")
+
 
 if __name__ == "__main__":
     unittest.main()

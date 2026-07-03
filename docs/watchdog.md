@@ -73,6 +73,30 @@ python -m py_compile launchers/strategy_watchdog.py launchers/test_strategy_watc
 
 Tests use temporary fixtures only; they do not modify live heartbeat files.
 
+## Futures Radar business-SLA checks
+
+Applies to **S5** (`heat_radar`) and **S6** (`accumulation_radar`).
+
+Process heartbeat freshness is **not** enough for the Futures Radar / 合约雷达 channel. A worker can remain `sleeping_ok` while Binance API failures prevent report generation and Telegram sends.
+
+Watchdog also inspects heartbeat business fields:
+
+- `lastScanOutcome`
+- `lastScanCompletedAt`
+- `lastTelegramSentAt`
+- `consecutiveScanFailures`
+- `lastApiErrorAt`
+
+### Business status rules (Phase 2A)
+
+| Status | Condition | Decision |
+|--------|-----------|----------|
+| `business_api_fail` | `consecutiveScanFailures >= 2` and `lastScanOutcome=binance_api_fail` | `would_warn` |
+| `business_sla_stale` | `lastTelegramSentAt` older than 2× expected interval (default 3600s) | `would_warn` |
+| `business_scan_stale` | `lastScanCompletedAt` older than 2× expected interval | `would_warn` |
+
+These rules produce **`would_warn` only** in Phase 2A. No auto-restart is triggered by business-SLA checks yet.
+
 ## Current behavior summary
 
 - Reads heartbeat JSON and PID files
