@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Phase 2A strategy watchdog — dry-run only.
+Phase 2A/2B strategy watchdog.
 
-Checks S1–S6 heartbeat files and PID files, reports what would be done.
-Never restarts or kills processes in this phase.
+Checks S1–S6 heartbeat files and PID files. Default is dry-run (Phase 2A).
+Phase 2B execute mode (--execute) may restart at most one strategy per run,
+with cooldown, rate limits, PID verification, and post-restart heartbeat checks.
 """
 
 from __future__ import annotations
@@ -12,15 +13,30 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 Decision = Literal["ok", "would_warn", "would_restart"]
+Action = Literal[
+    "none",
+    "warn_only",
+    "restart_skipped_dry_run",
+    "restart_skipped_cooldown",
+    "restart_skipped_rate_limit",
+    "restart_skipped_multiple_candidates",
+    "restart_skipped_unsafe_pid_match",
+    "restart_attempted",
+    "restart_success",
+    "restart_failed",
+    "restart_verification_timeout",
+]
 Status = Literal[
     "healthy",
     "sleeping_ok",
@@ -44,7 +60,31 @@ DEFAULT_PID_DIR = REPO_ROOT / "launchers" / "pids"
 DEFAULT_LOG_DIR = CORE_STRATEGY / "run-logs"
 DEFAULT_REPORT_PATH = DEFAULT_STATE_DIR / "watchdog-report.json"
 DEFAULT_LOG_PATH = DEFAULT_LOG_DIR / "strategy_watchdog.log"
+DEFAULT_RESTART_HISTORY_PATH = DEFAULT_STATE_DIR / "watchdog-restart-history.json"
 LAUNCHER_PS1 = REPO_ROOT / "launchers" / "launch_strategy.ps1"
+
+STRATEGY_SCRIPT_MARKERS: dict[str, str] = {
+    "S1": "s1_on_chain_narrative_radar.py",
+    "S2": "s2_alpha_monitor.py",
+    "S3": "s3_oi_funding_rate_scanner.py",
+    "S4": "s4_futures_alpha_autonomous_trading_v1.py",
+    "S5": "s5_accumulation_radar.py",
+    "S6": "s6_accumulation_radar.py",
+}
+
+BUSINESS_WARN_ONLY_STATUSES = frozenset(
+    {
+        "business_api_fail",
+        "business_sla_stale",
+        "business_scan_stale",
+    }
+)
+
+MAX_HISTORY_EVENTS = 200
+DEFAULT_RESTART_COOLDOWN_SEC = 900
+DEFAULT_MAX_RESTARTS_PER_HOUR = 2
+DEFAULT_VERIFY_TIMEOUT_SEC = 120
+DEFAULT_VERIFY_INTERVAL_SEC = 5
 
 ERROR_RESTART_MIN_COUNT = 3
 ERROR_RESTART_RECENT_SEC = 300
@@ -129,6 +169,7 @@ class StrategyCheckResult:
     last_telegram_sent_at: str | None = None
     consecutive_scan_failures: int | None = None
     last_api_error_at: str | None = None
+    action: Action = "none"
 
     def to_row(self) -> dict[str, Any]:
         row = {
@@ -142,6 +183,7 @@ class StrategyCheckResult:
             "phase": self.phase,
             "nextRunAt": self.next_run_at,
             "decision": self.decision,
+            "action": self.action,
             "reason": self.reason,
         }
         if self.strategy in BUSINESS_SLA_STRATEGIES:
@@ -617,6 +659,419 @@ def max_decision(a: Decision, b: Decision) -> Decision:
     return a if order[a] >= order[b] else b
 
 
+def _iso_now(dt: datetime | None = None) -> str:
+    dt = dt or _utc_now()
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _get_process_command_line(pid: int) -> str | None:
+    if pid <= 0:
+        return None
+    try:
+        import psutil  # type: ignore[import-untyped]
+
+        proc = psutil.Process(pid)
+        return " ".join(proc.cmdline())
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    if sys.platform != "win32":
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        line = (proc.stdout or "").strip()
+        return line if line else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def verify_pid_belongs_to_strategy(strategy: str, pid: int | None) -> bool:
+    """Return True when PID command line matches the strategy script marker."""
+    if pid is None or pid <= 0:
+        return True
+    marker = STRATEGY_SCRIPT_MARKERS.get(strategy)
+    if not marker:
+        return False
+    cmdline = _get_process_command_line(pid)
+    if not cmdline:
+        return False
+    if marker not in cmdline:
+        return False
+    launch_needle = f"-Strategy {strategy}"
+    if "launch_strategy.ps1" in cmdline and launch_needle not in cmdline:
+        return False
+    return True
+
+
+class RestartHistoryStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.events: list[dict[str, Any]] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.is_file():
+            self.events = []
+            return
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            try:
+                backup = self.path.with_name(
+                    f"{self.path.stem}.corrupt-{int(time.time())}{self.path.suffix}"
+                )
+                shutil.move(str(self.path), str(backup))
+            except OSError:
+                pass
+            self.events = []
+            return
+        if isinstance(data, dict) and isinstance(data.get("events"), list):
+            self.events = [e for e in data["events"] if isinstance(e, dict)]
+        else:
+            self.events = []
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        payload = {"events": self.events[-MAX_HISTORY_EVENTS:]}
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(self.path)
+
+    def append(self, event: dict[str, Any]) -> None:
+        self.events.append(event)
+        if len(self.events) > MAX_HISTORY_EVENTS:
+            self.events = self.events[-MAX_HISTORY_EVENTS:]
+        self._save()
+
+    def last_restart_started_at(self, strategy: str) -> datetime | None:
+        for event in reversed(self.events):
+            if event.get("strategy") != strategy:
+                continue
+            if event.get("dryRun") is True:
+                continue
+            action = str(event.get("action") or "")
+            if action not in {"restart_attempted", "restart_success", "restart_failed", "restart_verification_timeout"}:
+                continue
+            started = _parse_iso(event.get("startedAt") if isinstance(event.get("startedAt"), str) else None)
+            if started is not None:
+                return started
+        return None
+
+    def count_restarts_within(self, strategy: str, within_sec: float, now: datetime) -> int:
+        cutoff = now - timedelta(seconds=within_sec)
+        count = 0
+        for event in self.events:
+            if event.get("strategy") != strategy:
+                continue
+            if event.get("dryRun") is True:
+                continue
+            action = str(event.get("action") or "")
+            if action not in {"restart_attempted", "restart_success", "restart_failed", "restart_verification_timeout"}:
+                continue
+            started = _parse_iso(event.get("startedAt") if isinstance(event.get("startedAt"), str) else None)
+            if started is not None and started >= cutoff:
+                count += 1
+        return count
+
+
+def is_execute_restart_candidate(result: StrategyCheckResult) -> bool:
+    if result.decision != "would_restart":
+        return False
+    if result.status == "sleeping_ok":
+        return False
+    if result.status in BUSINESS_WARN_ONLY_STATUSES:
+        return False
+    return True
+
+
+def select_restart_candidate(
+    results: list[StrategyCheckResult],
+    *,
+    explicit_strategy: str | None = None,
+) -> tuple[StrategyCheckResult | None, list[StrategyCheckResult]]:
+    candidates = [r for r in results if is_execute_restart_candidate(r)]
+    if not candidates:
+        return None, []
+
+    if explicit_strategy:
+        matched = [r for r in candidates if r.strategy == explicit_strategy]
+        if not matched:
+            return None, candidates
+        chosen = matched[0]
+        skipped = [r for r in candidates if r.strategy != chosen.strategy]
+        return chosen, skipped
+
+    ordered = sorted(candidates, key=lambda r: (r.strategy == "S4", r.strategy))
+    chosen = ordered[0]
+    skipped = [r for r in ordered if r.strategy != chosen.strategy]
+    return chosen, skipped
+
+
+def assign_baseline_actions(results: list[StrategyCheckResult], *, dry_run: bool) -> None:
+    for r in results:
+        if r.decision == "ok":
+            r.action = "none"
+        elif r.decision == "would_warn":
+            r.action = "warn_only"
+        elif r.decision == "would_restart":
+            r.action = "restart_skipped_dry_run" if dry_run else "none"
+
+
+def verify_post_restart(
+    strategy: str,
+    *,
+    state_dir: Path,
+    restart_started_at: datetime,
+    timeout_sec: int,
+    interval_sec: int,
+    is_process_alive_fn: Callable[[int | None], bool | None] = is_process_alive,
+    read_hb_fn: Callable[[Path], tuple[dict[str, Any] | None, str | None]] = read_heartbeat_file,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> tuple[bool, datetime | None, str | None]:
+    cfg = STRATEGY_CONFIG[strategy]
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        hb, err = read_hb_fn(state_dir / f"{strategy}.heartbeat.json")
+        if hb is not None and err is None:
+            hb_strategy = str(hb.get("strategy") or "")
+            hb_worker = str(hb.get("worker") or "")
+            if hb_strategy and hb_strategy != strategy:
+                return False, None, f"heartbeat strategy mismatch ({hb_strategy!r})"
+            if hb_worker and hb_worker != cfg.worker:
+                return False, None, f"heartbeat worker mismatch ({hb_worker!r})"
+            last_hb = _parse_iso(hb.get("lastHeartbeatAt") if isinstance(hb.get("lastHeartbeatAt"), str) else None)
+            pid_raw = hb.get("pid")
+            pid = int(pid_raw) if isinstance(pid_raw, int) and pid_raw > 0 else None
+            if last_hb is not None and last_hb > restart_started_at:
+                alive = is_process_alive_fn(pid) if pid is not None else None
+                if alive is True:
+                    return True, last_hb, None
+        sleep_fn(max(0.1, float(interval_sec)))
+    return False, None, "verification_timeout"
+
+
+def _default_launch_strategy(strategy: str, launcher_ps1: Path) -> tuple[int, str]:
+    cmd = [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(launcher_ps1),
+        "-Strategy",
+        strategy,
+        "-Force",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output.strip()
+
+
+@dataclass
+class ExecuteConfig:
+    restart_cooldown_sec: int = DEFAULT_RESTART_COOLDOWN_SEC
+    max_restarts_per_hour: int = DEFAULT_MAX_RESTARTS_PER_HOUR
+    verify_timeout_sec: int = DEFAULT_VERIFY_TIMEOUT_SEC
+    verify_interval_sec: int = DEFAULT_VERIFY_INTERVAL_SEC
+    restart_history_path: Path = DEFAULT_RESTART_HISTORY_PATH
+    launcher_ps1: Path = LAUNCHER_PS1
+    explicit_strategy: str | None = None
+    launch_fn: Callable[[str, Path], tuple[int, str]] = _default_launch_strategy
+    sleep_fn: Callable[[float], None] = time.sleep
+    verify_pid_fn: Callable[[str, int | None], bool] = verify_pid_belongs_to_strategy
+    is_process_alive_fn: Callable[[int | None], bool | None] = is_process_alive
+
+
+def execute_restart_phase(
+    results: list[StrategyCheckResult],
+    *,
+    state_dir: Path,
+    pid_dir: Path,
+    dry_run: bool,
+    execute_config: ExecuteConfig,
+    logger: logging.Logger,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    now = now or _utc_now()
+    assign_baseline_actions(results, dry_run=dry_run)
+
+    candidate, skipped_multi = select_restart_candidate(
+        results, explicit_strategy=execute_config.explicit_strategy
+    )
+    for r in skipped_multi:
+        r.action = "restart_skipped_multiple_candidates"
+
+    if candidate is None:
+        return None
+
+    if dry_run:
+        candidate.action = "restart_skipped_dry_run"
+        return {"selectedStrategy": candidate.strategy, "dryRun": True}
+
+    history = RestartHistoryStore(execute_config.restart_history_path)
+    last_started = history.last_restart_started_at(candidate.strategy)
+    if last_started is not None:
+        since = (now - last_started).total_seconds()
+        if since < execute_config.restart_cooldown_sec:
+            candidate.action = "restart_skipped_cooldown"
+            logger.info(
+                "%s restart skipped (cooldown %ds < %ds)",
+                candidate.strategy,
+                int(since),
+                execute_config.restart_cooldown_sec,
+            )
+            return {"selectedStrategy": candidate.strategy, "skipped": "cooldown"}
+
+    recent = history.count_restarts_within(candidate.strategy, 3600, now)
+    if recent >= execute_config.max_restarts_per_hour:
+        candidate.action = "restart_skipped_rate_limit"
+        logger.info(
+            "%s restart skipped (rate limit %d >= %d per hour)",
+            candidate.strategy,
+            recent,
+            execute_config.max_restarts_per_hour,
+        )
+        return {"selectedStrategy": candidate.strategy, "skipped": "rate_limit"}
+
+    old_pid = candidate.pid_file_pid or candidate.heartbeat_pid
+    if old_pid is not None and candidate.process_alive is True:
+        if not execute_config.verify_pid_fn(candidate.strategy, old_pid):
+            candidate.action = "restart_skipped_unsafe_pid_match"
+            logger.warning(
+                "%s restart skipped (unsafe PID %s — cannot verify strategy ownership)",
+                candidate.strategy,
+                old_pid,
+            )
+            history.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "strategy": candidate.strategy,
+                    "reason": candidate.reason,
+                    "dryRun": False,
+                    "action": "restart_skipped_unsafe_pid_match",
+                    "oldPid": old_pid,
+                    "newPid": None,
+                    "startedAt": _iso_now(now),
+                    "completedAt": _iso_now(now),
+                    "verifiedAt": None,
+                    "error": "unsafe_pid_match",
+                }
+            )
+            return {"selectedStrategy": candidate.strategy, "skipped": "unsafe_pid_match"}
+
+    started_at = _utc_now()
+    event_id = str(uuid.uuid4())
+    candidate.action = "restart_attempted"
+    history.append(
+        {
+            "id": event_id,
+            "strategy": candidate.strategy,
+            "reason": candidate.reason,
+            "dryRun": False,
+            "action": "restart_attempted",
+            "oldPid": old_pid,
+            "newPid": None,
+            "startedAt": _iso_now(started_at),
+            "completedAt": None,
+            "verifiedAt": None,
+            "error": None,
+        }
+    )
+    logger.info("executing restart for %s: %s", candidate.strategy, candidate.reason)
+
+    exit_code, launch_output = execute_config.launch_fn(candidate.strategy, execute_config.launcher_ps1)
+    completed_at = _utc_now()
+    new_pid = read_pid_file(pid_dir / f"{candidate.strategy}.pid")
+
+    if exit_code != 0:
+        candidate.action = "restart_failed"
+        err = f"launcher exit {exit_code}"
+        history.append(
+            {
+                "id": event_id,
+                "strategy": candidate.strategy,
+                "reason": candidate.reason,
+                "dryRun": False,
+                "action": "restart_failed",
+                "oldPid": old_pid,
+                "newPid": new_pid,
+                "startedAt": _iso_now(started_at),
+                "completedAt": _iso_now(completed_at),
+                "verifiedAt": None,
+                "error": err,
+            }
+        )
+        logger.error("%s restart failed: %s", candidate.strategy, launch_output[:500])
+        return {"selectedStrategy": candidate.strategy, "launcherExitCode": exit_code, "error": err}
+
+    verified, verified_at, verify_err = verify_post_restart(
+        candidate.strategy,
+        state_dir=state_dir,
+        restart_started_at=started_at,
+        timeout_sec=execute_config.verify_timeout_sec,
+        interval_sec=execute_config.verify_interval_sec,
+        is_process_alive_fn=execute_config.is_process_alive_fn,
+        sleep_fn=execute_config.sleep_fn,
+    )
+
+    if verified:
+        candidate.action = "restart_success"
+        history.append(
+            {
+                "id": event_id,
+                "strategy": candidate.strategy,
+                "reason": candidate.reason,
+                "dryRun": False,
+                "action": "restart_success",
+                "oldPid": old_pid,
+                "newPid": new_pid,
+                "startedAt": _iso_now(started_at),
+                "completedAt": _iso_now(completed_at),
+                "verifiedAt": _iso_now(verified_at) if verified_at else _iso_now(completed_at),
+                "error": None,
+            }
+        )
+        logger.info("%s restart verified (newPid=%s)", candidate.strategy, new_pid)
+        return {"selectedStrategy": candidate.strategy, "newPid": new_pid, "verified": True}
+
+    candidate.action = "restart_verification_timeout" if verify_err == "verification_timeout" else "restart_failed"
+    history.append(
+        {
+            "id": event_id,
+            "strategy": candidate.strategy,
+            "reason": candidate.reason,
+            "dryRun": False,
+            "action": candidate.action,
+            "oldPid": old_pid,
+            "newPid": new_pid,
+            "startedAt": _iso_now(started_at),
+            "completedAt": _iso_now(completed_at),
+            "verifiedAt": None,
+            "error": verify_err or "verification_failed",
+        }
+    )
+    logger.error("%s restart verification failed: %s", candidate.strategy, verify_err)
+    return {
+        "selectedStrategy": candidate.strategy,
+        "newPid": new_pid,
+        "verified": False,
+        "error": verify_err,
+    }
+
+
 def run_watchdog(
     *,
     strategies: list[str] | None = None,
@@ -626,6 +1081,7 @@ def run_watchdog(
     log_path: Path = DEFAULT_LOG_PATH,
     dry_run: bool = True,
     verbose: bool = False,
+    execute_config: ExecuteConfig | None = None,
 ) -> tuple[list[StrategyCheckResult], int]:
     targets = strategies or list(STRATEGY_CONFIG.keys())
     now = _utc_now()
@@ -634,7 +1090,9 @@ def run_watchdog(
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("strategy_watchdog")
-    logger.handlers.clear()
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     handler = logging.FileHandler(log_path, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -659,10 +1117,26 @@ def run_watchdog(
             result.reason,
         )
 
+    if execute_config is None:
+        execute_config = ExecuteConfig(
+            explicit_strategy=strategies[0] if strategies and len(strategies) == 1 else None
+        )
+
+    execute_summary = execute_restart_phase(
+        results,
+        state_dir=state_dir,
+        pid_dir=pid_dir,
+        dry_run=dry_run,
+        execute_config=execute_config,
+        logger=logger,
+        now=now,
+    )
+
     exit_code = compute_exit_code(results)
     report = {
         "generatedAt": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "dryRun": dry_run,
+        "executeMode": not dry_run,
         "exitCode": exit_code,
         "strategies": [r.to_row() for r in results],
         "summary": {
@@ -672,12 +1146,15 @@ def run_watchdog(
             "would_restart": sum(1 for r in results if r.decision == "would_restart"),
         },
     }
+    if execute_summary is not None:
+        report["execute"] = execute_summary
     for r in results:
-        if r.decision != "ok":
+        if r.decision != "ok" or r.action not in ("none",):
             report.setdefault("actions", []).append(
                 {
                     "strategy": r.strategy,
                     "decision": r.decision,
+                    "action": r.action,
                     "command": r.would_restart_command if r.decision == "would_restart" else None,
                     "reason": r.reason,
                 }
@@ -685,6 +1162,9 @@ def run_watchdog(
 
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     logger.info("report written to %s (exit=%s)", report_path, exit_code)
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
     return results, exit_code
 
 
@@ -708,6 +1188,7 @@ def format_table(results: list[StrategyCheckResult]) -> str:
         "phase",
         "nextRunAt",
         "decision",
+        "action",
         "reason",
     ]
     rows: list[list[str]] = []
@@ -726,6 +1207,7 @@ def format_table(results: list[StrategyCheckResult]) -> str:
                 r.phase or "",
                 (r.next_run_at or "")[:19],
                 r.decision,
+                r.action,
                 r.reason[:60] + ("…" if len(r.reason) > 60 else ""),
             ]
         )
@@ -744,14 +1226,51 @@ def format_table(results: list[StrategyCheckResult]) -> str:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Phase 2A strategy watchdog (dry-run only)")
+    parser = argparse.ArgumentParser(
+        description="Strategy watchdog (Phase 2A dry-run default; Phase 2B with --execute)"
+    )
     parser.add_argument("--once", action="store_true", help="Run a single check and exit")
     parser.add_argument("--interval", type=int, default=60, help="Seconds between checks (loop mode)")
     parser.add_argument(
         "--dry-run",
         default="true",
         choices=["true", "false"],
-        help="Dry-run mode (default true; false is not implemented in Phase 2A)",
+        help="Dry-run mode (default true). Ignored when --execute is set.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Phase 2B: perform at most one real restart when warranted (default is dry-run).",
+    )
+    parser.add_argument(
+        "--restart-cooldown-sec",
+        type=int,
+        default=DEFAULT_RESTART_COOLDOWN_SEC,
+        help="Minimum seconds between restarts for the same strategy (default 900).",
+    )
+    parser.add_argument(
+        "--max-restarts-per-hour",
+        type=int,
+        default=DEFAULT_MAX_RESTARTS_PER_HOUR,
+        help="Max restart attempts per strategy per hour (default 2).",
+    )
+    parser.add_argument(
+        "--post-restart-verify-timeout-sec",
+        type=int,
+        default=DEFAULT_VERIFY_TIMEOUT_SEC,
+        help="Seconds to wait for post-restart heartbeat verification (default 120).",
+    )
+    parser.add_argument(
+        "--post-restart-verify-interval-sec",
+        type=int,
+        default=DEFAULT_VERIFY_INTERVAL_SEC,
+        help="Polling interval during post-restart verification (default 5).",
+    )
+    parser.add_argument(
+        "--restart-history-path",
+        type=Path,
+        default=DEFAULT_RESTART_HISTORY_PATH,
+        help="Path to restart history JSON (default run-state/watchdog-restart-history.json).",
     )
     parser.add_argument("--json", action="store_true", help="Print JSON report to stdout")
     parser.add_argument("--strategy", type=str, help="Check a single strategy (e.g. S3)")
@@ -763,15 +1282,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _build_execute_config(args: argparse.Namespace, explicit_strategy: str | None) -> ExecuteConfig:
+    return ExecuteConfig(
+        restart_cooldown_sec=max(0, args.restart_cooldown_sec),
+        max_restarts_per_hour=max(1, args.max_restarts_per_hour),
+        verify_timeout_sec=max(1, args.post_restart_verify_timeout_sec),
+        verify_interval_sec=max(1, args.post_restart_verify_interval_sec),
+        restart_history_path=args.restart_history_path,
+        explicit_strategy=explicit_strategy,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.dry_run.lower() != "true":
-        print("Phase 2A only supports --dry-run true", file=sys.stderr)
+    dry_run = not args.execute
+    if args.execute:
+        dry_run = False
+    elif args.dry_run.lower() != "true":
+        print("Use --execute for real restarts; default is dry-run.", file=sys.stderr)
         return 2
 
     strategies = None
+    explicit_strategy: str | None = None
     if args.strategy:
-        strategies = [args.strategy.strip().upper()]
+        explicit_strategy = args.strategy.strip().upper()
+        strategies = [explicit_strategy]
+
+    execute_config = _build_execute_config(args, explicit_strategy)
 
     def cycle() -> int:
         results, exit_code = run_watchdog(
@@ -780,8 +1317,9 @@ def main(argv: list[str] | None = None) -> int:
             pid_dir=args.pid_dir,
             report_path=args.report_path,
             log_path=args.log_path,
-            dry_run=True,
+            dry_run=dry_run,
             verbose=args.verbose,
+            execute_config=execute_config,
         )
         if args.json:
             print(json.dumps([r.to_row() for r in results], ensure_ascii=False, indent=2))
@@ -789,7 +1327,8 @@ def main(argv: list[str] | None = None) -> int:
             print(format_table(results))
             print(f"\nreport: {args.report_path}")
             print(f"log:    {args.log_path}")
-            print(f"exit:   {exit_code} (dry-run — no restarts performed)")
+            mode = "dry-run — no restarts performed" if dry_run else "execute — at most one restart per run"
+            print(f"exit:   {exit_code} ({mode})")
         return exit_code
 
     if args.once or args.interval <= 0:
