@@ -9,6 +9,7 @@ run-state/
 
 # Process and launcher runtime
 pids/
+*.pid
 
 # Strategy outputs and caches
 node_out/
@@ -17,6 +18,8 @@ __pycache__/
 .mypy_cache/
 cache/
 tmp/
+node_modules/
+.next/
 
 # Databases and dumps
 *.db
